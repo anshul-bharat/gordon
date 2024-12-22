@@ -4,50 +4,88 @@ import "core:fmt"
 import glm "core:math/linalg/glsl"
 import gl "vendor:wasm/WebGL"
 
-// DEFAULT_CANVAS_ID :: "gordon-canvas"
 
+Vec2 :: [2]f32
+Vec3 :: [3]f32
+Vec4 :: [4]f32
+
+Color :: [4]u8
 
 Context :: struct {
-	canvas_id:  string,
-	accum_time: f32,
-	is_done:    bool,
-	program:    gl.Program,
-	buffer:     gl.Buffer,
-	step:       Step_Proc,
-	fini:       Fini_Proc,
-	_next:      ^Context,
+	canvas_id:     string,
+	accum_time:    f32,
+	is_done:       bool,
+	program:       gl.Program,
+	vertex_buffer: gl.Buffer,
+	camera:        Camera,
+	curr_depth:    f32,
+	vertices:      [dynamic]Vertex,
+	draw_calls:    [dynamic]Draw_Call,
+	update:        Update_Proc,
+	fini:          Fini_Proc,
+	_next:         ^Context,
 }
 
-Step_Proc :: proc(ctx: ^Context, dt: f32)
+Update_Proc :: proc(ctx: ^Context, dt: f32)
 Fini_Proc :: proc(ctx: ^Context)
+
+Camera :: struct {
+	offset:           Vec2,
+	target:           Vec2,
+	rotation_radians: f32,
+	zoom:             f32,
+	near:             f32,
+	far:              f32,
+}
+
+Camera_Default :: Camera {
+	zoom = 1,
+	near = -1024,
+	far  = 1024,
+}
+
+Vertex :: struct {
+	pos: Vec3,
+	col: Color,
+	uv:  Vec2,
+}
+
+Draw_Call :: struct {
+	program: gl.Program,
+	texture: gl.Texture,
+	offset:  int,
+	length:  int,
+}
 
 @(private)
 global_context_list: ^Context
 
-init :: proc(ctx: ^Context, canvas_id: string, step: Step_Proc, fini: Fini_Proc = nil) -> bool {
+init :: proc(ctx: ^Context, canvas_id: string, step: Update_Proc, fini: Fini_Proc = nil) -> bool {
 	ctx.canvas_id = canvas_id
-	gl.CreateCurrentContextById(ctx.canvas_id, {}) or_return
+	gl.CreateCurrentContextById(ctx.canvas_id, gl.DEFAULT_CONTEXT_ATTRIBUTES) or_return
 
-	if step == nil {
-		return false
-	}
+	// if step == nil {
+	// 	return false
+	// }
 
-	ctx.step = step
+	ctx.update = step
+	ctx.fini = fini
+
+	ctx.camera = Camera_Default
+
+	gl.SetCurrentContextById(ctx.canvas_id) or_return
 	ctx.program = gl.CreateProgramFromStrings({shader_vert}, {shader_frag}) or_return
+	
+	reserve(&ctx.vertices, 1 << 10)
+	reserve(&ctx.draw_calls, 1 << 5)
 
-	vertices := [][5]f32 {
-		{+0.0, +0.5, +1.0, +0.0, +1.0},
-		{+0.5, -0.5, +0.0, +1.0, +0.0},
-		{-0.5, -0.5, +0.0, +0.0, +1.0},
-	}
-
-	ctx.buffer = gl.CreateBuffer()
-	gl.BindBuffer(gl.ARRAY_BUFFER, ctx.buffer)
+	ctx.vertex_buffer = gl.CreateBuffer()
+	gl.BindBuffer(gl.ARRAY_BUFFER, ctx.vertex_buffer)
 	gl.BufferData(
 		gl.ARRAY_BUFFER,
-		len(vertices) * size_of(vertices[0]),
-		raw_data(vertices),
-		gl.STATIC_DRAW,
+		len(ctx.vertices) * size_of(ctx.vertices[0]),
+		nil,
+		gl.DYNAMIC_DRAW,
 	)
 
 	ctx._next = global_context_list
@@ -60,14 +98,15 @@ fini :: proc(ctx: ^Context) {
 	if ctx.fini != nil {
 		ctx->fini()
 	}
-
-	// gl.DeleteBuffer(ctx.buffer)
-	// gl.DeleteProgram(ctx.program)
+	gl.DeleteBuffer(ctx.vertex_buffer)
+	gl.DeleteProgram(ctx.program)
 }
 
 @(export)
 step :: proc(dt: f32) -> bool {
 	for ctx := global_context_list; ctx != nil; ctx = ctx._next {
+		ctx.accum_time += dt
+
 		if ctx.is_done == true {
 			p := &global_context_list
 			for p^ != ctx {
@@ -78,48 +117,87 @@ step :: proc(dt: f32) -> bool {
 			continue
 		}
 
-		ctx.accum_time += dt
 		gl.SetCurrentContextById(ctx.canvas_id) or_continue
-		ctx.step(ctx, dt)
-		draw(ctx)
+		ctx.update(ctx, dt)
+		draw_all(ctx)
 	}
 	return true
 }
 
-draw :: proc(ctx: ^Context) -> bool {
+draw_all :: proc(ctx: ^Context) -> bool {
 	gl.SetCurrentContextById(ctx.canvas_id) or_return
+
+	gl.BindBuffer(gl.ARRAY_BUFFER, ctx.vertex_buffer)
+	gl.BufferData(
+		gl.ARRAY_BUFFER,
+		len(ctx.vertices) * size_of(ctx.vertices[0]),
+		raw_data(ctx.vertices),
+		gl.DYNAMIC_DRAW,
+	)
+
+	defer {
+		clear(&ctx.vertices)
+		clear(&ctx.draw_calls)
+		ctx.curr_depth = 0
+	}
 
 	width, height := gl.DrawingBufferWidth(), gl.DrawingBufferHeight()
 	aspect := f32(max(width, 1)) / f32(max(height, 1))
+	
 	gl.Viewport(0, 0, width, height)
 
+	gl.Enable(gl.DEPTH_TEST)
+
 	gl.ClearColor(0.5, 0.7, 1.0, 1.0)
-	gl.Clear(gl.COLOR_BUFFER_BIT)
+	gl.Clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT)
 
 	gl.UseProgram(ctx.program)
 
+	a_pos := gl.GetAttribLocation(ctx.program, "a_pos")
+	gl.EnableVertexAttribArray(a_pos)
+	gl.VertexAttribPointer(a_pos, 3, gl.FLOAT, false, size_of(Vertex), offset_of(Vertex, pos))
+
+	a_color := gl.GetAttribLocation(ctx.program, "a_col")
+	gl.EnableVertexAttribArray(a_color)
+	gl.VertexAttribPointer(
+		a_color,
+		4,
+		gl.UNSIGNED_BYTE,
+		true,
+		size_of(Vertex),
+		offset_of(Vertex, col),
+	)
+
+	a_uv := gl.GetAttribLocation(ctx.program, "a_uv")
+	gl.EnableVertexAttribArray(a_uv)
+	gl.VertexAttribPointer(a_uv, 2, gl.FLOAT, false, size_of(Vertex), offset_of(Vertex, uv))
+
 	{
-		loc := gl.GetAttribLocation(ctx.program, "a_position")
-		gl.EnableVertexAttribArray(loc)
-		gl.VertexAttribPointer(loc, 2, gl.FLOAT, false, size_of([5]f32), 0)
+		// proj := glm.mat4Perspective(glm.radians_f32(60.0), aspect, 0.1, 100.0)
+		proj := glm.mat4Ortho3d(0, f32(width), f32(height), 0, ctx.camera.near, ctx.camera.far)
+		// proj := glm.mat4Ortho3d(-1, +1, -1, +1, -1, +1)
+
+		origin := glm.mat4Translate({-ctx.camera.target.x, -ctx.camera.target.y, 0})
+		rotation := glm.mat4Rotate({0, 0, 1}, ctx.camera.rotation_radians)
+		scale := glm.mat4Scale({ctx.camera.zoom, ctx.camera.zoom, 1})
+		transtation := glm.mat4Translate({ctx.camera.offset.x, ctx.camera.offset.y, 0})
+
+		view := origin * scale * rotation * transtation
+		model := glm.mat4Rotate({0, 0, 1}, ctx.accum_time)
+
+		mvp := proj * view //* model
+
+		gl.UniformMatrix4fv(gl.GetUniformLocation(ctx.program, "u_mvp"), mvp)
 	}
-	{
-		loc := gl.GetAttribLocation(ctx.program, "a_color")
-		gl.EnableVertexAttribArray(loc)
-		gl.VertexAttribPointer(loc, 3, gl.FLOAT, false, size_of([5]f32), size_of([2]f32))
-	}
-	{
-		mvp := glm.mat4(1)
-		mvp =
-			glm.mat4Perspective(glm.radians_f32(60.0), aspect, 0.1, 100.0) *
-			glm.mat4LookAt({1.2, 1.2, 1.2}, {0, 0, 0}, {0, 0, 1}) *
-			glm.mat4Rotate({0, 0, 1}, ctx.accum_time)
-		loc := gl.GetUniformLocation(ctx.program, "u_mvp")
-		gl.UniformMatrix4fv(loc, mvp)
-		gl.VertexAttribPointer(loc, 3, gl.FLOAT, false, size_of([5]f32), size_of([2]f32))
+	if len(ctx.draw_calls) > 0 {
+		last := &ctx.draw_calls[len(ctx.draw_calls) - 1]
+
+		last.length = len(ctx.vertices) - last.offset
 	}
 
-	gl.DrawArrays(gl.TRIANGLES, 0, 3)
+	for dc in ctx.draw_calls {
+		gl.DrawArrays(gl.TRIANGLES, dc.offset, dc.length)
+	}
 
 	return true
 }
@@ -131,16 +209,19 @@ main :: proc() {
 shader_vert :: `
 precision highp float;
 
-attribute vec2 a_position;
-attribute vec3 a_color;
+attribute vec3 a_pos;
+attribute vec4 a_col;
+attribute vec2 a_uv;
 
 uniform mat4 u_mvp;
 
-varying vec3 v_color;
+varying vec4 v_color;
+varying vec2 v_uv;
 
 void main() {
-	v_color = a_color;
-	gl_Position = u_mvp * vec4(a_position, 0.0, 1.0);
+	v_color = a_col;
+	v_uv = a_uv;
+	gl_Position = u_mvp * vec4(a_pos, 1.0);
 }
 `
 
@@ -148,10 +229,10 @@ void main() {
 shader_frag :: `
 precision highp float;
 
-varying vec3 v_color;
+varying vec4 v_color;
 
 void main() {
-	gl_FragColor = vec4(v_color, 1.0);
+	gl_FragColor = v_color;
 }
 `
 
